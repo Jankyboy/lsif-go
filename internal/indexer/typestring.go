@@ -24,6 +24,9 @@ func typeString(obj types.Object) (signature string, extra string) {
 			// TODO(efritz) - make this be "(T).F" instead of "struct field F string"
 			return fmt.Sprintf("struct %s", obj.String()), ""
 		}
+
+	case *types.Const:
+		return fmt.Sprintf("%s = %s", types.ObjectString(obj, packageQualifier), v.Val()), ""
 	}
 
 	return types.ObjectString(obj, packageQualifier), ""
@@ -37,6 +40,21 @@ func packageQualifier(*types.Package) string { return "" }
 func formatTypeSignature(obj *types.TypeName) string {
 	switch obj.Type().Underlying().(type) {
 	case *types.Struct:
+		if obj.IsAlias() {
+			switch obj.Type().(type) {
+			case *types.Named:
+				original := obj.Type().(*types.Named).Obj()
+				var pkg string
+				if obj.Pkg().Name() != original.Pkg().Name() {
+					pkg = original.Pkg().Name() + "."
+				}
+				return fmt.Sprintf("type %s = %s%s", obj.Name(), pkg, original.Name())
+
+			case *types.Struct:
+				return fmt.Sprintf("type %s = struct", obj.Name())
+			}
+		}
+
 		return fmt.Sprintf("type %s struct", obj.Name())
 	case *types.Interface:
 		return fmt.Sprintf("type %s interface", obj.Name())

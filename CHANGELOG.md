@@ -11,7 +11,99 @@ All notable changes to `lsif-go` are documented in this file.
 
 ## Unreleased changes
 
-Nothing yet.
+## v1.6.3
+
+## Changed
+
+- Improved error messages.
+
+## v1.6.2
+
+## Fixed
+
+- API docs no longer incorrectly tags Functions/Variables/etc sections as a package.
+- API docs no longer emits null tag lists in violation of the spec.
+
+## v1.6.1
+
+## Fixed
+
+- API docs no longer incorrectly tags some methods as functions and vice-versa.
+
+## v1.6.0
+
+### Added
+
+- API docs now emit data linking `resultSet`s to `documentationResult`s, making it possible to go from hover/definition/references to API docs and vice-versa.
+- API docs now respect the latest Sourcegraph extension spec.
+- API docs now emit search keys for documentation to enable search indexing.
+
+### Changed
+
+- API docs index pages are now directory-structured, instead of a flat list of Go packages.
+- API docs symbols are now sorted (exported-first, alphabetical order.)
+
+### Fixed
+
+- API docs no longer include blank const/var declarations (`const _ = ...`)
+- API docs now only index top-level declarations, not e.g. variables inside functions.
+- API docs do a better job of trimming very long var/const declaration lines.
+- API docs no longer emit an empty "Functions" section if there are no functions in a package.
+- API docs no longer emit duplicate path IDs, which were forbidden in the spec.
+- API docs now emit many more tags for documentation sections: whether something is a function, const, var, public, etc.
+- API docs now tag benchmark/test functions as such properly.
+
+## v1.5.0
+
+### Added
+
+- API documentation is now emitted as [an extension to LSIF](https://github.com/sourcegraph/sourcegraph/pull/20108) in order to support documentation generation in the form of e.g. https://pkg.go.dev and https://godocs.io. [#150](https://github.com/sourcegraph/lsif-go/pull/150)
+
+### Changed
+
+- :rotating_light: Changed package module version generation to make cross-index queries accurate. Cross-linking may not work with indexes created before v1.5.0. [#152](https://github.com/sourcegraph/lsif-go/pull/152)
+- Improve moniker identifiers for exported identifiers in projects with no go.mod file. [#153](https://github.com/sourcegraph/lsif-go/pull/153)
+
+### Fixed
+
+- Fixed moniker identifiers for composite structs and interfaces. [#135](https://github.com/sourcegraph/lsif-go/pull/135)
+- Fixed definition relationship with composite structs and interfaces. [#156](https://github.com/sourcegraph/lsif-go/pull/156)
+- Fixed error-on-startup caused by unresolvable module name in go.mod file. [#157](https://github.com/sourcegraph/lsif-go/pull/157)
+
+## v1.4.0
+
+### Added
+
+- Added const values to hover text. [#144](https://github.com/sourcegraph/lsif-go/pull/144)
+- Support replace directives in go.mod. [#145](https://github.com/sourcegraph/lsif-go/pull/145)
+- Infer package name from git upstream when go.mod file is absent. [#149](https://github.com/sourcegraph/lsif-go/pull/149)
+
+### Changed
+
+- :rotating_light: Changed moniker identifier generation to support replace directives and vanity imports. Cross-index linking will work only for indexes created on or after v1.4.0. [#145](https://github.com/sourcegraph/lsif-go/pull/145)
+- Deduplicated import moniker vertices. [#146](https://github.com/sourcegraph/lsif-go/pull/146)
+- Update lsif-protocol dependency. [#136](https://github.com/sourcegraph/lsif-go/pull/136)
+- Avoid scanning duplicate test packages. [#138](https://github.com/sourcegraph/lsif-go/pull/138)
+
+### Fixed
+
+- Fix bad moniker generation for cross-index fields. [#148](https://github.com/sourcegraph/lsif-go/pull/148)
+
+## v1.3.1
+
+### Fixed
+
+- Fixed type assertion panic with aliases to anonymous structs. [#134](https://github.com/sourcegraph/lsif-go/pull/134)
+
+## v1.3.0
+
+### Changed
+
+- Type alias hovers now name the aliased type e.g. `type Alias = pkg.Original`. [#131](https://github.com/sourcegraph/lsif-go/pull/131)
+
+### Fixed 
+
+- Definition of the RHS type symbol in a type alias is no longer the type alias itself but the type being aliased. [#131](https://github.com/sourcegraph/lsif-go/pull/131)
 
 ## v1.2.0
 

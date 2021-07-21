@@ -1,4 +1,4 @@
-package indexer
+package parallel
 
 import (
 	"sync/atomic"
@@ -6,14 +6,14 @@ import (
 	"time"
 )
 
-func TestRunParallel(t *testing.T) {
+func TestRun(t *testing.T) {
 	ch := make(chan func(), 3)
 	ch <- func() {}
 	ch <- func() {}
 	ch <- func() {}
 	close(ch)
 
-	wg, n := runParallel(ch)
+	wg, n := Run(ch)
 	wg.Wait()
 
 	if *n != 3 {
@@ -21,7 +21,7 @@ func TestRunParallel(t *testing.T) {
 	}
 }
 
-func TestRunParallelProgress(t *testing.T) {
+func TestRunProgress(t *testing.T) {
 	sync1 := make(chan struct{})
 	sync2 := make(chan struct{})
 	sync3 := make(chan struct{})
@@ -32,7 +32,7 @@ func TestRunParallelProgress(t *testing.T) {
 	ch <- func() { <-sync3 }
 	close(ch)
 
-	wg, n := runParallel(ch)
+	wg, n := Run(ch)
 
 	checkValue := func(expected uint64) {
 		var v uint64

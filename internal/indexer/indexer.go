@@ -3,6 +3,7 @@ package indexer
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -11,20 +12,23 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
-	protocol "github.com/sourcegraph/lsif-protocol"
-	"github.com/sourcegraph/lsif-protocol/writer"
+	"github.com/sourcegraph/lsif-go/internal/gomod"
+	"github.com/sourcegraph/lsif-go/internal/output"
+	"github.com/sourcegraph/sourcegraph/lib/codeintel/lsif/protocol"
+	"github.com/sourcegraph/sourcegraph/lib/codeintel/lsif/protocol/writer"
 	"golang.org/x/tools/go/packages"
 )
 
 type Indexer struct {
-	repositoryRoot string            // path to repository
-	projectRoot    string            // path to package
-	toolInfo       protocol.ToolInfo // metadata vertex payload
-	moduleName     string            // name of this module
-	moduleVersion  string            // version of this module
-	dependencies   map[string]string // parsed module data
-	emitter        *writer.Emitter   // LSIF data emitter
-	outputOptions  OutputOptions     // What to print to stdout/stderr
+	repositoryRoot   string                  // path to repository
+	repositoryRemote string                  // import path inferred by git remote
+	projectRoot      string                  // path to package
+	toolInfo         protocol.ToolInfo       // metadata vertex payload
+	moduleName       string                  // name of this module
+	moduleVersion    string                  // version of this module
+	dependencies     map[string]gomod.Module // parsed module data
+	emitter          *writer.Emitter         // LSIF data emitter
+	outputOptions    output.Options          // What to print to stdout/stderr
 
 	// Definition type cache
 	consts  map[interface{}]*DefinitionInfo // position -> info
@@ -35,14 +39,18 @@ type Indexer struct {
 	vars    map[interface{}]*DefinitionInfo // position -> info
 
 	// LSIF data cache
-	documents             map[string]*DocumentInfo  // filename -> info
-	ranges                map[string]map[int]uint64 // filename -> offset -> rangeID
-	hoverResultCache      map[string]uint64         // cache key -> hoverResultID
-	packageInformationIDs map[string]uint64         // name -> packageInformationID
-	packageDataCache      *PackageDataCache         // hover text and moniker path cache
-	packages              []*packages.Package       // index target packages
-	projectID             uint64                    // project vertex identifier
-	packagesByFile        map[string][]*packages.Package
+	documents                                map[string]*DocumentInfo    // filename -> info
+	ranges                                   map[string]map[int]uint64   // filename -> offset -> rangeID
+	defined                                  map[string]map[int]struct{} // set of defined ranges (filename, offset)
+	hoverResultCache                         map[string]uint64           // cache key -> hoverResultID
+	importMonikerIDs                         map[string]uint64           // identifier:packageInformationID -> monikerID
+	packageInformationIDs                    map[string]uint64           // name -> packageInformationID
+	packageDataCache                         *PackageDataCache           // hover text and moniker path cache
+	packages                                 []*packages.Package         // index target packages
+	projectID                                uint64                      // project vertex identifier
+	packagesByFile                           map[string][]*packages.Package
+	emittedDocumentationResults              map[types.Object]uint64 // type object -> documentationResult vertex ID
+	emittedDocumentationResultsByPackagePath map[string]uint64       // package path -> documentationResult vertex ID
 
 	constsMutex                sync.Mutex
 	funcsMutex                 sync.Mutex
@@ -52,22 +60,25 @@ type Indexer struct {
 	varsMutex                  sync.Mutex
 	stripedMutex               *StripedMutex
 	hoverResultCacheMutex      sync.RWMutex
+	importMonikerIDsMutex      sync.RWMutex
 	packageInformationIDsMutex sync.RWMutex
 }
 
 func New(
 	repositoryRoot string,
+	repositoryRemote string,
 	projectRoot string,
 	toolInfo protocol.ToolInfo,
 	moduleName string,
 	moduleVersion string,
-	dependencies map[string]string,
+	dependencies map[string]gomod.Module,
 	jsonWriter writer.JSONWriter,
 	packageDataCache *PackageDataCache,
-	outputOptions OutputOptions,
+	outputOptions output.Options,
 ) *Indexer {
 	return &Indexer{
 		repositoryRoot:        repositoryRoot,
+		repositoryRemote:      repositoryRemote,
 		projectRoot:           projectRoot,
 		toolInfo:              toolInfo,
 		moduleName:            moduleName,
@@ -83,7 +94,9 @@ func New(
 		vars:                  map[interface{}]*DefinitionInfo{},
 		documents:             map[string]*DocumentInfo{},
 		ranges:                map[string]map[int]uint64{},
+		defined:               map[string]map[int]struct{}{},
 		hoverResultCache:      map[string]uint64{},
+		importMonikerIDs:      map[string]uint64{},
 		packageInformationIDs: map[string]uint64{},
 		packageDataCache:      packageDataCache,
 		stripedMutex:          newStripedMutex(),
@@ -94,20 +107,21 @@ func New(
 // and writing the LSIF equivalent to the output source that implements io.Writer.
 // It is caller's responsibility to close the output source if applicable.
 func (i *Indexer) Index() error {
-	if err := i.loadPackages(); err != nil {
-		return errors.Wrap(err, "loadPackages")
+	if err := i.loadPackages(true); err != nil {
+		return errors.Wrap(err, "failed to load packages")
 	}
 
 	i.emitMetadataAndProjectVertex()
 	i.emitDocuments()
 	i.addImports()
+	i.indexDocumentation() // must be invoked before indexDefinitions/indexReferences
 	i.indexDefinitions()
 	i.indexReferences()
 	i.linkReferenceResultsToRanges()
 	i.emitContains()
 
 	if err := i.emitter.Flush(); err != nil {
-		return errors.Wrap(err, "emitter.Flush")
+		return errors.Wrap(err, "failed to write index to disk")
 	}
 
 	return nil
@@ -117,7 +131,9 @@ var loadMode = packages.NeedDeps | packages.NeedFiles | packages.NeedImports | p
 
 // packages populates the packages field containing an AST for each package within the configured
 // project root.
-func (i *Indexer) loadPackages() error {
+//
+// deduplicate should be true in all cases except TestIndexer_shouldVisitPackage.
+func (i *Indexer) loadPackages(deduplicate bool) error {
 	errs := make(chan error, 1)
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -139,7 +155,18 @@ func (i *Indexer) loadPackages() error {
 			return
 		}
 
-		i.packages = pkgs
+		if deduplicate {
+			keep := make([]*packages.Package, 0, len(pkgs))
+			for _, pkg := range pkgs {
+				if i.shouldVisitPackage(pkg, pkgs) {
+					keep = append(keep, pkg)
+				}
+			}
+			i.packages = keep
+		} else {
+			i.packages = pkgs
+		}
+
 		i.packagesByFile = map[string][]*packages.Package{}
 
 		for _, p := range i.packages {
@@ -150,8 +177,46 @@ func (i *Indexer) loadPackages() error {
 		}
 	}()
 
-	withProgress(&wg, "Loading packages", i.outputOptions, nil, 0)
+	output.WithProgressParallel(&wg, "Loading packages", i.outputOptions, nil, 0)
 	return <-errs
+}
+
+// shouldVisitPackage tells if the package p should be visited.
+//
+// According to the `Tests` field in https://pkg.go.dev/golang.org/x/tools/go/packages#Config
+// the loader may produce up to four packages for a single Go package directory:
+//
+// 	// For example, when using the go command, loading "fmt" with Tests=true
+// 	// returns four packages, with IDs "fmt" (the standard package),
+// 	// "fmt [fmt.test]" (the package as compiled for the test),
+// 	// "fmt_test" (the test functions from source files in package fmt_test),
+// 	// and "fmt.test" (the test binary).
+//
+// This function handles deduplication, returning true ("should visit") if it makes sense
+// to index the input package (or false if doing so would be duplicative.)
+func (i *Indexer) shouldVisitPackage(p *packages.Package, allPackages []*packages.Package) bool {
+	// The loader returns 4 packages because (loader.Config).Tests==true and we
+	// want to avoid duplication.
+	if p.Name == "main" && strings.HasSuffix(p.ID, ".test") {
+		return false // synthesized `go test` program
+	}
+	if strings.HasSuffix(p.Name, "_test") {
+		return true
+	}
+
+	// Index only the combined test package if it's present. If the package has no test files,
+	// it won't be present, and we need to just index the default package.
+	pkgHasTests := false
+	for _, op := range allPackages {
+		if op.ID == fmt.Sprintf("%s [%s.test]", p.PkgPath, p.PkgPath) {
+			pkgHasTests = true
+			break
+		}
+	}
+	if pkgHasTests && !strings.HasSuffix(p.ID, ".test]") {
+		return false
+	}
+	return true
 }
 
 // packagesLoadLogger logs the debug messages from the packages.Load function.
@@ -161,7 +226,7 @@ func (i *Indexer) loadPackages() error {
 // unmarshal the fourth log argument value (a *bytes.Buffer of go list stdout)
 // as a stream of JSON objects representing loaded (or candidate) packages.
 func (i *Indexer) packagesLoadLogger(format string, args ...interface{}) {
-	if i.outputOptions.Verbosity < VeryVeryVerboseOutput || len(args) < 4 {
+	if i.outputOptions.Verbosity < output.VeryVeryVerboseOutput || len(args) < 4 {
 		return
 	}
 	stdoutBuf, ok := args[3].(*bytes.Buffer)
@@ -212,6 +277,7 @@ func (i *Indexer) emitDocument(filename string) {
 	documentID := i.emitter.EmitDocument(languageGo, filename)
 	i.documents[filename] = &DocumentInfo{DocumentID: documentID}
 	i.ranges[filename] = map[int]uint64{}
+	i.defined[filename] = map[int]struct{}{}
 }
 
 // addImports modifies the definitions map of each file to include entries for import statements so
@@ -303,11 +369,18 @@ func (i *Indexer) indexDefinitionsForPackage(p *packages.Package) {
 		}
 
 		pos, d, ok := i.positionAndDocument(p, obj.Pos())
-		if !ok || !i.markRange(pos) {
+		if !ok {
+			continue
+		}
+		if !i.markRange(pos) {
+			// This performs a quick assignment to a map that will ensure that
+			// we don't race against another routine indexing the same definition
+			// reachable from another dataflow path through the indexer. If we
+			// lose a race, we'll just bail out and look at the next definition.
 			continue
 		}
 
-		rangeID := i.indexDefinition(p, pos.Filename, d, pos, obj, typeSwitchHeader)
+		rangeID := i.indexDefinition(p, pos.Filename, d, pos, obj, typeSwitchHeader, ident)
 
 		i.stripedMutex.LockKey(pos.Filename)
 		i.ranges[pos.Filename][pos.Offset] = rangeID
@@ -337,11 +410,11 @@ func (i *Indexer) positionAndDocument(p *packages.Package, pos token.Pos) (token
 	return position, d, true
 }
 
-// markRange sets an empty range identifier in the ranges map for the given position.
-// If a  range for this identifier has already been marked, this method returns false.
+// markRange sets a zero-size struct into a map for the given position. If this position
+// has already been marked, this method returns false.
 func (i *Indexer) markRange(pos token.Position) bool {
 	i.stripedMutex.RLockKey(pos.Filename)
-	_, ok := i.ranges[pos.Filename][pos.Offset]
+	_, ok := i.defined[pos.Filename][pos.Offset]
 	i.stripedMutex.RUnlockKey(pos.Filename)
 	if ok {
 		return false
@@ -350,17 +423,19 @@ func (i *Indexer) markRange(pos token.Position) bool {
 	i.stripedMutex.LockKey(pos.Filename)
 	defer i.stripedMutex.UnlockKey(pos.Filename)
 
-	if _, ok := i.ranges[pos.Filename][pos.Offset]; ok {
+	if _, ok := i.defined[pos.Filename][pos.Offset]; ok {
 		return false
 	}
 
-	i.ranges[pos.Filename][pos.Offset] = 0 // placeholder
+	i.defined[pos.Filename][pos.Offset] = struct{}{}
 	return true
 }
 
 // indexDefinition emits data for the given definition object.
-func (i *Indexer) indexDefinition(p *packages.Package, filename string, document *DocumentInfo, pos token.Position, obj types.Object, typeSwitchHeader bool) uint64 {
-	rangeID := i.emitter.EmitRange(rangeForObject(obj, pos))
+func (i *Indexer) indexDefinition(p *packages.Package, filename string, document *DocumentInfo, pos token.Position, obj types.Object, typeSwitchHeader bool, ident *ast.Ident) uint64 {
+	// Ensure the range exists, but don't emit a new one as it might already exist due to another
+	// phase of indexing (such as symbols) having emitted the range.
+	rangeID, _ := i.ensureRangeFor(pos, obj)
 	resultSetID := i.emitter.EmitResultSet()
 	defResultID := i.emitter.EmitDefinitionResult()
 
@@ -376,7 +451,7 @@ func (i *Indexer) indexDefinition(p *packages.Package, filename string, document
 		// Create a hover result vertex and cache the result identifier keyed by the definition location.
 		// Caching this gives us a big win for package documentation, which is likely to be large and is
 		// repeated at each import and selector within referenced files.
-		_ = i.emitter.EmitTextDocumentHover(resultSetID, i.makeCachedHoverResult(nil, obj, func() []protocol.MarkedString {
+		_ = i.emitter.EmitTextDocumentHover(resultSetID, i.makeCachedHoverResult(nil, obj, func() protocol.MarkupContent {
 			return findHoverContents(i.packageDataCache, i.packages, p, obj)
 		}))
 	}
@@ -389,12 +464,23 @@ func (i *Indexer) indexDefinition(p *packages.Package, filename string, document
 		i.emitExportMoniker(resultSetID, p, obj)
 	}
 
-	i.setDefinitionInfo(obj, &DefinitionInfo{
-		DocumentID:        document.DocumentID,
-		RangeID:           rangeID,
-		ResultSetID:       resultSetID,
-		ReferenceRangeIDs: map[uint64][]uint64{},
-		TypeSwitchHeader:  typeSwitchHeader,
+	// If the pkg/object has associated documentation, link to it. This enables e.g. going from documentation
+	// for a symbol <-> its definition/hover/references/etc in either direction.
+	if pkgName, ok := obj.(*types.PkgName); ok {
+		if documentationResultID, ok := i.emittedDocumentationResultsByPackagePath[pkgName.Imported().Path()]; ok {
+			_ = i.emitter.EmitDocumentationResultEdge(documentationResultID, resultSetID)
+		}
+	} else if documentationResultID, ok := i.emittedDocumentationResults[obj]; ok {
+		_ = i.emitter.EmitDocumentationResultEdge(documentationResultID, resultSetID)
+	}
+
+	i.setDefinitionInfo(obj, ident, &DefinitionInfo{
+		DocumentID:         document.DocumentID,
+		RangeID:            rangeID,
+		ResultSetID:        resultSetID,
+		DefinitionResultID: defResultID,
+		ReferenceRangeIDs:  map[uint64][]uint64{},
+		TypeSwitchHeader:   typeSwitchHeader,
 	})
 
 	return rangeID
@@ -403,7 +489,7 @@ func (i *Indexer) indexDefinition(p *packages.Package, filename string, document
 // setDefinitionInfo stashes the given definition info indexed by the given object type and name.
 // This definition info will be accessible by invoking getDefinitionInfo with the same type and
 // name values (but not necessarily the same object).
-func (i *Indexer) setDefinitionInfo(obj types.Object, d *DefinitionInfo) {
+func (i *Indexer) setDefinitionInfo(obj types.Object, ident *ast.Ident, d *DefinitionInfo) {
 	switch v := obj.(type) {
 	case *types.Const:
 		i.constsMutex.Lock()
@@ -427,7 +513,9 @@ func (i *Indexer) setDefinitionInfo(obj types.Object, d *DefinitionInfo) {
 
 	case *types.TypeName:
 		i.typesMutex.Lock()
-		i.types[obj.Type().String()] = d
+		// solves issue when in the case of a type alias, the obj.Type().String() of the type alias
+		// is == to the obj.Type().String() of the type it aliases.
+		i.types[ident.String()+"="+obj.Type().String()] = d
 		i.typesMutex.Unlock()
 
 	case *types.Var:
@@ -457,7 +545,7 @@ func (i *Indexer) indexReferencesForPackage(p *packages.Package) {
 			continue
 		}
 
-		rangeID, ok := i.indexReference(p, d, pos, definitionObj)
+		rangeID, ok := i.indexReference(p, d, pos, definitionObj, ident)
 		if !ok {
 			continue
 		}
@@ -469,8 +557,8 @@ func (i *Indexer) indexReferencesForPackage(p *packages.Package) {
 }
 
 // indexReference emits data for the given reference object.
-func (i *Indexer) indexReference(p *packages.Package, document *DocumentInfo, pos token.Position, definitionObj types.Object) (uint64, bool) {
-	if def := i.getDefinitionInfo(definitionObj); def != nil {
+func (i *Indexer) indexReference(p *packages.Package, document *DocumentInfo, pos token.Position, definitionObj types.Object, ident *ast.Ident) (uint64, bool) {
+	if def := i.getDefinitionInfo(definitionObj, ident); def != nil {
 		return i.indexReferenceToDefinition(p, document, pos, definitionObj, def)
 	}
 
@@ -480,7 +568,7 @@ func (i *Indexer) indexReference(p *packages.Package, document *DocumentInfo, po
 // getDefinitionInfo returns the definition info object for the given object. This requires that
 // setDefinitionInfo was previously called an object that can be resolved in the same way. This
 // will only return definitions which are defined in an index target (not a dependency).
-func (i *Indexer) getDefinitionInfo(obj types.Object) *DefinitionInfo {
+func (i *Indexer) getDefinitionInfo(obj types.Object, ident *ast.Ident) *DefinitionInfo {
 	switch v := obj.(type) {
 	case *types.Const:
 		return i.consts[v.Pos()]
@@ -491,7 +579,7 @@ func (i *Indexer) getDefinitionInfo(obj types.Object) *DefinitionInfo {
 	case *types.PkgName:
 		return i.imports[v.Pos()]
 	case *types.TypeName:
-		return i.types[obj.Type().String()]
+		return i.types[ident.String()+"="+obj.Type().String()]
 	case *types.Var:
 		return i.vars[v.Pos()]
 	}
@@ -502,8 +590,22 @@ func (i *Indexer) getDefinitionInfo(obj types.Object) *DefinitionInfo {
 // indexReferenceToDefinition emits data for the given reference object that is defined within
 // an index target package.
 func (i *Indexer) indexReferenceToDefinition(p *packages.Package, document *DocumentInfo, pos token.Position, definitionObj types.Object, d *DefinitionInfo) (uint64, bool) {
-	rangeID := i.ensureRangeFor(pos, definitionObj)
-	_ = i.emitter.EmitNext(rangeID, d.ResultSetID)
+	rangeID, ok := i.ensureRangeFor(pos, definitionObj)
+	if !ok {
+		// Not a new range result; this occurs when the definition and reference
+		// ranges overlap (e.g., unnamed nested structs). We attach a defintion
+		// edge directly to the range (instead of the result set) so that it takes
+		// precedence over the definition attached to the result set (itself).
+		//
+		// In the case of unnamed nested structs, this supports go to definition
+		// from the field to the type definition.
+		_ = i.emitter.EmitTextDocumentDefinition(rangeID, d.DefinitionResultID)
+	} else {
+		// If this was a new range (a reference range only), then we just link the
+		// range to the result set of the definition to attach it to the existing
+		// graph of definitions, references, and hover text.
+		_ = i.emitter.EmitNext(rangeID, d.ResultSetID)
+	}
 
 	d.m.Lock()
 	d.ReferenceRangeIDs[document.DocumentID] = append(d.ReferenceRangeIDs[document.DocumentID], rangeID)
@@ -514,7 +616,7 @@ func (i *Indexer) indexReferenceToDefinition(p *packages.Package, document *Docu
 		// hover result of the type switch header for this use. Each reference of such a variable
 		// will need a more specific hover text, as the type of the variable is refined in the body
 		// of case clauses of the type switch.
-		_ = i.emitter.EmitTextDocumentHover(rangeID, i.makeCachedHoverResult(nil, definitionObj, func() []protocol.MarkedString {
+		_ = i.emitter.EmitTextDocumentHover(rangeID, i.makeCachedHoverResult(nil, definitionObj, func() protocol.MarkupContent {
 			return findHoverContents(i.packageDataCache, i.packages, p, definitionObj)
 		}))
 	}
@@ -535,11 +637,11 @@ func (i *Indexer) indexReferenceToExternalDefinition(p *packages.Package, docume
 	// (scoped ot the object's package name). Caching this gives us another big win as some
 	// methods imported from other packages are likely to be used many times in a dependent
 	// project (e.g., context.Context, http.Request, etc).
-	hoverResultID := i.makeCachedHoverResult(definitionPkg, definitionObj, func() []protocol.MarkedString {
+	hoverResultID := i.makeCachedHoverResult(definitionPkg, definitionObj, func() protocol.MarkupContent {
 		return findExternalHoverContents(i.packageDataCache, i.packages, p, definitionObj)
 	})
 
-	rangeID := i.ensureRangeFor(pos, definitionObj)
+	rangeID, _ := i.ensureRangeFor(pos, definitionObj)
 	refResultID := i.emitter.EmitReferenceResult()
 	_ = i.emitter.EmitTextDocumentReferences(rangeID, refResultID)
 	_ = i.emitter.EmitItemOfReferences(refResultID, []uint64{rangeID}, document.DocumentID)
@@ -554,12 +656,12 @@ func (i *Indexer) indexReferenceToExternalDefinition(p *packages.Package, docume
 
 // ensureRangeFor returns a range identifier for the given object. If a range for the object has
 // not been emitted, a new vertex is created.
-func (i *Indexer) ensureRangeFor(pos token.Position, obj types.Object) uint64 {
+func (i *Indexer) ensureRangeFor(pos token.Position, obj types.Object) (uint64, bool) {
 	i.stripedMutex.RLockKey(pos.Filename)
 	rangeID, ok := i.ranges[pos.Filename][pos.Offset]
 	i.stripedMutex.RUnlockKey(pos.Filename)
 	if ok {
-		return rangeID
+		return rangeID, false
 	}
 
 	// Note: we calculate this outside of the critical section
@@ -569,12 +671,12 @@ func (i *Indexer) ensureRangeFor(pos token.Position, obj types.Object) uint64 {
 	defer i.stripedMutex.UnlockKey(pos.Filename)
 
 	if rangeID, ok := i.ranges[pos.Filename][pos.Offset]; ok {
-		return rangeID
+		return rangeID, false
 	}
 
 	rangeID = i.emitter.EmitRange(start, end)
 	i.ranges[pos.Filename][pos.Offset] = rangeID
-	return rangeID
+	return rangeID, true
 }
 
 // linkReferenceResultsToRanges emits item relations for each indexed definition result value.
